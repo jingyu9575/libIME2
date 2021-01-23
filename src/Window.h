@@ -75,7 +75,7 @@ public:
 
     void hide(){ ShowWindow(hwnd_, SW_HIDE); }
 
-    void refresh()    {    InvalidateRect( hwnd_, NULL, FALSE );    }
+    virtual void refresh()    {    InvalidateRect( hwnd_, NULL, FALSE );    }
 
     static bool registerClass(HINSTANCE hinstance);
 

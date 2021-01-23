@@ -23,7 +23,13 @@
 #include "ImeWindow.h"
 #include <string>
 #include <vector>
+#include <memory>
+#include <type_traits>
+#include <filesystem>
 #include "ComObject.h"
+#include "DrawUtils.h"
+#pragma comment(lib, "Msimg32.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 namespace Ime {
 
@@ -31,12 +37,39 @@ class TextService;
 class EditSession;
 class KeyEvent;
 
-// TODO: make the candidate window looks different in immersive mode
 class CandidateWindow:
     public ImeWindow,
     public ComObject<ComInterface<ITfCandidateListUIElement>> {
 public:
-    CandidateWindow(TextService* service, EditSession* session);
+    struct Theme {
+        struct Margin {
+            int top = 0, right = 0, bottom = 0, left = 0;
+
+            void read(const std::filesystem::path& conf, const std::wstring& section);
+            auto xspace() const { return left + right; }
+            auto yspace() const { return top + bottom; }
+        };
+
+        struct StretchedImage {
+            std::unique_ptr<GdiWicBitmap> image;
+            Margin margin;
+
+            void read(const std::filesystem::path& conf, const std::wstring& section,
+                const std::filesystem::path& dir);
+            void paint(HDC dc, const RECT& rect) const;
+        private:
+            std::string imageData;
+        };
+
+        StretchedImage background, highlight;
+        Margin textMargin, contentMargin;
+        LOGFONT font;
+        COLORREF normalColor, highlightCandidateColor;
+
+        Theme(const std::filesystem::path& dir);
+    };
+
+    CandidateWindow(TextService* service, EditSession* session, const Theme* theme);
 
     // ITfUIElement
     STDMETHODIMP GetDescription(BSTR *pbstrDescription);
@@ -53,6 +86,8 @@ public:
     STDMETHODIMP GetPageIndex(UINT *puIndex, UINT uSize, UINT *puPageCnt);
     STDMETHODIMP SetPageIndex(UINT *puIndex, UINT uPageCnt);
     STDMETHODIMP GetCurrentPage(UINT *puPage);
+
+    void refresh() override;
 
     const std::vector<std::wstring>& items() const {
         return items_;
@@ -102,9 +137,8 @@ public:
 
 protected:
     LRESULT wndProc(UINT msg, WPARAM wp , LPARAM lp);
-    void onPaint(WPARAM wp, LPARAM lp);
-    void paintItem(HDC hDC, int i, int x, int y);
-    void itemRect(int i, RECT& rect);
+    void paint(HDC dc, const RECT& clientRect);
+    std::wstring candidateString(size_t i);
 
 protected: // COM object should not be deleted directly. calling Release() instead.
     ~CandidateWindow(void);
@@ -123,6 +157,9 @@ private:
     int currentSel_;
     bool hasResult_;
     bool useCursor_;
+
+    const Theme* theme_;
+    std::wstring composition_;
 };
 
 }

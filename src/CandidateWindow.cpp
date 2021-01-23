@@ -27,12 +27,17 @@
 
 #include <tchar.h>
 #include <windows.h>
+#include <shlwapi.h>
+#include <fstream>
+#include <sstream>
 
 using namespace std;
+using namespace std::literals;
 
 namespace Ime {
 
-CandidateWindow::CandidateWindow(TextService* service, EditSession* session):
+CandidateWindow::CandidateWindow(TextService* service, EditSession* session,
+    const CandidateWindow::Theme* theme) :
     ImeWindow(service),
     shown_(false),
     candPerRow_(1),
@@ -41,7 +46,8 @@ CandidateWindow::CandidateWindow(TextService* service, EditSession* session):
     currentSel_(0),
     hasResult_(false),
     useCursor_(true),
-    selKeyWidth_(0) {
+    selKeyWidth_(0),
+    theme_(theme) {
 
     if(service->isImmersive()) { // windows 8 app mode
         margin_ = 10;
@@ -55,7 +61,7 @@ CandidateWindow::CandidateWindow(TextService* service, EditSession* session):
     }
 
     HWND parent = service->compositionWindow(session);
-    create(parent, WS_POPUP|WS_CLIPCHILDREN, WS_EX_TOOLWINDOW|WS_EX_TOPMOST);
+    create(parent, WS_POPUP|WS_CLIPCHILDREN, WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_LAYERED);
 }
 
 CandidateWindow::~CandidateWindow(void) {
@@ -162,9 +168,6 @@ STDMETHODIMP CandidateWindow::GetCurrentPage(UINT *puPage) {
 
 LRESULT CandidateWindow::wndProc(UINT msg, WPARAM wp , LPARAM lp) {
     switch (msg) {
-        case WM_PAINT:
-            onPaint(wp, lp);
-            break;
         case WM_ERASEBKGND:
             return TRUE;
             break;
@@ -185,109 +188,93 @@ LRESULT CandidateWindow::wndProc(UINT msg, WPARAM wp , LPARAM lp) {
     return 0;
 }
 
-void CandidateWindow::onPaint(WPARAM wp, LPARAM lp) {
-    // TODO: check isImmersive_, and draw the window differently
-    // in Windows 8 app immersive mode to follow windows 8 UX guidelines
-    PAINTSTRUCT ps;
-    BeginPaint(hwnd_, &ps);
-    HDC hDC = ps.hdc;
-    HFONT oldFont;
-    RECT rc;
+void CandidateWindow::refresh() {
+    RECT clientRect;
+    GetClientRect(hwnd_, &clientRect);
+    SIZE size = rectSize(clientRect);
 
-    oldFont = (HFONT)SelectObject(hDC, font_);
+    GdiDC dcDesktop(GetDC(HWND_DESKTOP), HWND_DESKTOP);
+    GdiDC dc(CreateCompatibleDC(dcDesktop));
+    GdiObject bmp(CreateCompatibleBitmap(dcDesktop, size.cx, size.cy));
+    GdiDCSelector bmpSelector(dc, bmp);
+    paint(dc, clientRect);
 
-    GetClientRect(hwnd_,&rc);
-    SetTextColor(hDC, GetSysColor(COLOR_WINDOWTEXT));
-    SetBkColor(hDC, GetSysColor(COLOR_WINDOW));
+    POINT ptSrc = {};
+    RECT windowRect;
+    GetWindowRect(hwnd_, &windowRect);
+    POINT ptDst = { windowRect.left, windowRect.top };
 
-    // paint window background and border
-    // draw a flat black border in Windows 8 app immersive mode
-    // draw a 3d border in desktop mode
-    if(isImmersive()) {
-        HPEN pen = ::CreatePen(PS_SOLID, 3, RGB(0, 0, 0));
-        HGDIOBJ oldPen = ::SelectObject(hDC, pen);
-        ::Rectangle(hDC, rc.left, rc.top, rc.right, rc.bottom);
-        ::SelectObject(hDC, oldPen);
-        ::DeleteObject(pen);
+    BLENDFUNCTION blend = bmpBlendFunction();
+    ::UpdateLayeredWindow(hwnd_, dcDesktop, &ptDst, &size, dc, &ptSrc, 0, &blend, ULW_ALPHA);
+}
+
+void CandidateWindow::paint(HDC dc, const RECT& clientRect) {
+    DPIScaler ds(dc);
+    SIZE clientSize = rectSize(clientRect);
+
+    theme_->background.paint(dc, clientRect);
+    
+    POINT pt{ theme_->contentMargin.left, theme_->contentMargin.top };
+    GdiObject font(ds.createFont(theme_->font));
+
+    if (!composition_.empty()) {
+        GdiTextBlender textBlender(dc, clientSize, theme_->normalColor, 255);
+        SIZE size = textBlender(composition_, { pt.x + ds.x(theme_->textMargin.left),
+            pt.y + ds.y(theme_->textMargin.top) }, font);
+        pt.y += size.cy + ds.y(theme_->textMargin.yspace());
     }
-    else {
-        // draw a 3d border in desktop mode
-        ::FillSolidRect(ps.hdc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, GetSysColor(COLOR_WINDOW));
-        ::Draw3DBorder(hDC, &rc, GetSysColor(COLOR_3DFACE), 0);
+    
+    GdiTextBlender normalTextBlender(dc, clientSize, theme_->normalColor, 255);
+    for (size_t i = 0; i < items_.size(); ++i) {
+        auto str = candidateString(i);
+        SIZE size;
+        if (useCursor_ && i == currentSel_) {
+            POINT ptText{ pt.x + ds.x(theme_->textMargin.left),
+                pt.y + ds.y(theme_->textMargin.top) };
+            {
+                GdiTextBlender highlightTextBlender(dc, clientSize,
+                    theme_->highlightCandidateColor, 255);
+                size = highlightTextBlender(str, ptText, font);
+            }
+            theme_->highlight.paint(dc, pointSizeRect(ptText, size));
+        } else
+            size = normalTextBlender(str, { pt.x + ds.x(theme_->textMargin.left),
+                pt.y + ds.y(theme_->textMargin.top) }, font);
+        pt.x += size.cx + ds.x(theme_->textMargin.xspace());
     }
+}
 
-    // paint items
-    int col = 0;
-    int x = margin_, y = margin_;
-    for(int i = 0, n = items_.size(); i < n; ++i) {
-        paintItem(hDC, i, x, y);
-        ++col; // go to next column
-        if(col >= candPerRow_) {
-            col = 0;
-            x = margin_;
-            y += itemHeight_ + rowSpacing_;
-        }
-        else {
-            x += colSpacing_ + selKeyWidth_ + textWidth_;
-        }
-    }
-    SelectObject(hDC, oldFont);
-    EndPaint(hwnd_, &ps);
+wstring CandidateWindow::candidateString(size_t i) {
+    return (selKeys_[i] ? selKeys_[i] + L"."s : L"") + items_[i];
 }
 
 void CandidateWindow::recalculateSize() {
-    if(items_.empty()) {
-        resize(margin_ * 2, margin_ * 2);
+    GdiDC dc(::GetWindowDC(hwnd_), hwnd_);
+    DPIScaler ds(dc);
+    SIZE totalSize{ 0, 0 };
+    GdiObject font(ds.createFont(theme_->font));
+    GdiDCSelector fontSelector(dc, font);
+    if (!composition_.empty()) {
+        SIZE size;
+        ::GetTextExtentPoint32W(dc, composition_.c_str(), composition_.size(), &size);
+        totalSize.cx = size.cx + ds.x(theme_->textMargin.xspace());
+        totalSize.cy = size.cy + ds.y(theme_->textMargin.yspace());
     }
 
-    HDC hDC = ::GetWindowDC(hwnd());
-    int height = 0;
-    int width = 0;
-    selKeyWidth_ = 0;
-    textWidth_ = 0;
-    itemHeight_ = 0;
-
-    HGDIOBJ oldFont = ::SelectObject(hDC, font_);
-    vector<wstring>::const_iterator it;
-    for(int i = 0, n = items_.size(); i < n; ++i) {
-        SIZE selKeySize;
-        int lineHeight = 0;
-        // the selection key string
-        wchar_t selKey[] = L"?. ";
-        selKey[0] = selKeys_[i];
-        ::GetTextExtentPoint32W(hDC, selKey, 3, &selKeySize);
-        if(selKeySize.cx > selKeyWidth_)
-            selKeyWidth_ = selKeySize.cx;
-
-        // the candidate string
-        SIZE candidateSize;
-        wstring& item = items_.at(i);
-        ::GetTextExtentPoint32W(hDC, item.c_str(), item.length(), &candidateSize);
-        if(candidateSize.cx > textWidth_)
-            textWidth_ = candidateSize.cx;
-        int itemHeight = max(candidateSize.cy, selKeySize.cy);
-        if(itemHeight > itemHeight_)
-            itemHeight_ = itemHeight;
+    SIZE candidateSize{ 0, 0 };
+    for (size_t i = 0; i < items_.size(); ++i) {
+        auto str = candidateString(i);
+        SIZE size;
+        ::GetTextExtentPoint32W(dc, str.c_str(), str.size(), &size);
+        candidateSize.cx += size.cx + ds.x(theme_->textMargin.xspace());
+        candidateSize.cy = (max) (candidateSize.cy, size.cy + ds.y(theme_->textMargin.yspace()));
     }
-    ::SelectObject(hDC, oldFont);
-    ::ReleaseDC(hwnd(), hDC);
+    totalSize.cx = (max) (totalSize.cx, candidateSize.cx);
+    totalSize.cy = (max) (totalSize.cy, candidateSize.cy);
 
-    if(items_.size() <= candPerRow_) {
-        width = items_.size() * (selKeyWidth_ + textWidth_);
-        width += colSpacing_ * (items_.size() - 1);
-        width += margin_ * 2;
-        height = itemHeight_ + margin_ * 2;
-    }
-    else {
-        width = candPerRow_ * (selKeyWidth_ + textWidth_);
-        width += colSpacing_ * (candPerRow_ - 1);
-        width += margin_ * 2;
-        int rowCount = items_.size() / candPerRow_;
-        if(items_.size() % candPerRow_)
-            ++rowCount;
-        height = itemHeight_ * rowCount + rowSpacing_ * (rowCount - 1) + margin_ * 2;
-    }
-    resize(width, height);
+    totalSize.cx += ds.x(theme_->contentMargin.xspace());
+    totalSize.cy += ds.y(theme_->contentMargin.yspace());
+    resize(totalSize.cx, totalSize.cy);
 }
 
 void CandidateWindow::setCandPerRow(int n) {
@@ -325,12 +312,7 @@ bool CandidateWindow::filterKeyEvent(KeyEvent& keyEvent) {
     }
     // if currently selected item is changed, redraw
     if(currentSel_ != oldSel) {
-        // repaint the old and new items
-        RECT rect;
-        itemRect(oldSel, rect);
-        ::InvalidateRect(hwnd_, &rect, TRUE);
-        itemRect(currentSel_, rect);
-        ::InvalidateRect(hwnd_, &rect, TRUE);
+        refresh();
         return true;
     }
     return false;
@@ -341,8 +323,7 @@ void CandidateWindow::setCurrentSel(int sel) {
         sel = 0;
     if (currentSel_ != sel) {
         currentSel_ = sel;
-        if (isVisible())
-            ::InvalidateRect(hwnd_, NULL, TRUE);
+        refresh();
     }
 }
 
@@ -355,47 +336,119 @@ void CandidateWindow::clear() {
 
 void CandidateWindow::setUseCursor(bool use) {
     useCursor_ = use;
-    if(isVisible())
-        ::InvalidateRect(hwnd_, NULL, TRUE);
+    // caller will refresh
 }
 
-void CandidateWindow::paintItem(HDC hDC, int i,  int x, int y) {
-    RECT textRect = {x, y, 0, y + itemHeight_};
-    wchar_t selKey[] = L"?. ";
-    selKey[0] = selKeys_[i];
-    textRect.right = textRect.left + selKeyWidth_;
-    // FIXME: make the color of strings configurable.
-    COLORREF selKeyColor = RGB(0, 0, 255);
-    COLORREF oldColor = ::SetTextColor(hDC, selKeyColor);
-    // paint the selection key
-    ::ExtTextOut(hDC, textRect.left, textRect.top, ETO_OPAQUE, &textRect, selKey, 3, NULL);
-    ::SetTextColor(hDC, oldColor); // restore text color
+static wstring readIni(const filesystem::path& file, const wstring& section,
+    const wstring& key, const wstring& fallback) {
+    wchar_t buffer[MAX_PATH];
+    ::GetPrivateProfileStringW(section.c_str(), key.c_str(), fallback.c_str(),
+        &*buffer, sizeof(buffer) / sizeof(buffer[0]), file.c_str());
+    return &*buffer;
+}
 
-    // paint the candidate string
-    wstring& item = items_.at(i);
-    textRect.left += selKeyWidth_;
-    textRect.right = textRect.left + textWidth_;
-    // paint the candidate string
-    ::ExtTextOut(hDC, textRect.left, textRect.top, ETO_OPAQUE, &textRect, item.c_str(), item.length(), NULL);
+static int readIni(const filesystem::path& file, const wstring& section,
+    const wstring& key, int fallback) {
+    return (int) ::GetPrivateProfileIntW(section.c_str(), key.c_str(),
+        fallback, file.c_str());
+}
 
-    if(useCursor_ && i == currentSel_) { // invert the selected item
-        int left = textRect.left; // - selKeyWidth_;
-        int top = textRect.top;
-        int width = textRect.right - left;
-        int height = itemHeight_;
-        ::BitBlt(hDC, left, top, width, itemHeight_, hDC, left, top, NOTSRCCOPY);
+static LOGFONT readIniFont(const filesystem::path& file, const wstring& section,
+    const wstring& prefix) {
+    auto defaultFont = (HFONT) GetStockObject(DEFAULT_GUI_FONT);
+    LOGFONT lf;
+    GetObjectW(defaultFont, sizeof(lf), &lf);
+    auto name = readIni(file, section, prefix, lf.lfFaceName);
+    auto i = name.find_last_of(L' ');
+    if (i != wstring::npos) {
+        wchar_t* p;
+        auto suffix = name.substr(i + 1);
+        long size = wcstol(suffix.c_str(), &p, 10);
+        if (!errno && !*p && size > 0) {
+            name = name.substr(0, i);
+            lf.lfHeight = size;
+        }
+    }
+    constexpr unsigned max_name_size =
+        sizeof(lf.lfFaceName) / sizeof(lf.lfFaceName[0]) - 1;
+    if (name.size() > max_name_size)
+        name.resize(max_name_size);
+    wcscpy(lf.lfFaceName, name.c_str());
+    return lf;
+}
+
+static int readIniColor(const filesystem::path& file, const wstring& section,
+    const wstring& key, int fallback) {
+    auto str = readIni(file, section, key, wstring());
+    if (!str.empty() && str[0] == L'#') str = str.substr(1);
+    if (str.size() != 6) return fallback;
+    for (auto c : str)
+        if (!(L'0' <= c && c <= L'9' || L'a' <= c && c <= L'f' ||
+            L'A' <= c && c <= L'F'))
+            return fallback;
+    int v = wcstol(str.c_str(), NULL, 16);
+    return RGB((v & 0xFF0000) >> 16, (v & 0xFF00) >> 8, v & 0xFF);
+}
+
+void CandidateWindow::Theme::Margin::read(const std::filesystem::path& conf, const wstring& section) {
+    top = readIni(conf, section, L"Top", 0);
+    right = readIni(conf, section, L"Right", 0);
+    bottom = readIni(conf, section, L"Bottom", 0);
+    left = readIni(conf, section, L"Left", 0);
+}
+
+void CandidateWindow::Theme::StretchedImage::read(const std::filesystem::path& conf,
+    const std::wstring& section, const std::filesystem::path& dir) {
+    auto file = dir / readIni(conf, section, L"Image", L"image.png");
+    image = make_unique<GdiWicBitmap>(file.c_str());
+    margin.read(conf, section + L"/Margin");
+}
+
+void CandidateWindow::Theme::StretchedImage::paint(HDC dc, const RECT& rect) const {
+    if (!image) return;
+
+    struct Strechable {
+        int value;
+        bool stretched;
+
+        int operator()(int total, DPIScaler::Value dsv) const {
+            return (stretched ? total : 0) + dsv(value);
+        }
+    };
+    struct Dim { Strechable start, size; };
+    vector<Dim> xDims{
+        {{ 0, false }, { margin.left, false }},
+        {{ margin.left, false }, { -margin.left - margin.right, true }},
+        {{ -margin.right, true }, { margin.right, false }},
+    };
+    vector<Dim> yDims{
+        {{ 0, false }, { margin.top, false } },
+        {{ margin.top, false}, { -margin.top - margin.bottom, true }},
+        {{ -margin.bottom, true}, { margin.bottom, false }},
+    };
+
+    DPIScaler ds(dc);
+    DPIScaler::Value nods;
+    SIZE size = rectSize(rect);
+    for (auto&& x : xDims) for (auto&& y : yDims) {
+        image->paint(dc, pointSizeRect(
+            { rect.left + x.start(size.cx, ds.x),rect.top + y.start(size.cy, ds.y) },
+            { x.size(size.cx, ds.x), y.size(size.cy, ds.y) }),
+            pointSizeRect(
+                { x.start(image->width(), nods), y.start(image->height(), nods) },
+                { x.size(image->width(), nods), y.size(image->height(), nods) }));
     }
 }
 
-void CandidateWindow::itemRect(int i, RECT& rect) {
-    int row, col;
-    row = i / candPerRow_;
-    col = i % candPerRow_;
-    rect.left = margin_ + col * (selKeyWidth_ + textWidth_ + colSpacing_);
-    rect.top = margin_ + row * (itemHeight_ + rowSpacing_);
-    rect.right = rect.left + (selKeyWidth_ + textWidth_);
-    rect.bottom = rect.top + itemHeight_;
+CandidateWindow::Theme::Theme(const filesystem::path& dir) {
+    auto conf = dir / "theme.conf";
+    background.read(conf, L"InputPanel/Background", dir);
+    textMargin.read(conf, L"InputPanel/TextMargin");
+    contentMargin.read(conf, L"InputPanel/ContentMargin");
+    font = readIniFont(conf, L"InputPanel", L"Font");
+    normalColor = readIniColor(conf, L"InputPanel", L"NormalColor", 0x000000);
+    highlightCandidateColor = readIniColor(conf, L"InputPanel",
+        L"HighlightCandidateColor", 0x000000);
 }
-
 
 } // namespace Ime
